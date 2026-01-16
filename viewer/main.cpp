@@ -3,7 +3,9 @@
 #include <cmath>
 #include <string>
 #include <cstring>
+#include <limits>
 
+#include "core/Scene.hpp"
 #include "analysis/SceneAnalyzer.hpp"
 #include "geom/AABB.hpp"
 #include "geom/Vec2.hpp"
@@ -12,6 +14,158 @@ const int W = 1200;
 const int H = 800;
 static const int SIDEBAR_W = 360;
 static const int VIEW_W = W - SIDEBAR_W;
+
+
+// ---------- World <-> Screen mapping ----------
+struct Viewport {
+  AABB world;
+  int viewW = 840;
+  int viewH = 800;
+  int margin = 40;
+  int x0 = 0;            // left offset of viewport in screen space
+  double scale = 1.0;
+
+  void computeScale() {
+    const double worldW = world.max.x - world.min.x;
+    const double worldH = world.max.y - world.min.y;
+    const double sx = (viewW - 2.0 * margin) / worldW;
+    const double sy = (viewH - 2.0 * margin) / worldH;
+    scale = std::min(sx, sy);
+  }
+
+  bool mouseInView(const Vector2& m) const {
+    return m.x >= x0 && m.x < (x0 + viewW) && m.y >= 0 && m.y < viewH;
+  }
+
+  Vector2 worldToScreen(const Vec2& p) const {
+    const double x = x0 + margin + (p.x - world.min.x) * scale;
+    const double y = margin + (world.max.y - p.y) * scale;
+    return Vector2{(float)x, (float)y};
+  }
+
+  Vec2 screenToWorld(const Vector2& s) const {
+    const double x = world.min.x + (s.x - x0 - margin) / scale;
+    const double y = world.max.y - (s.y - margin) / scale;
+    return Vec2{x, y};
+  }
+
+  Rectangle worldAABBToScreenRect(const AABB& b) const {
+    Vector2 tl = worldToScreen(Vec2{b.min.x, b.max.y});
+    Vector2 br = worldToScreen(Vec2{b.max.x, b.min.y});
+    return Rectangle{tl.x, tl.y, br.x - tl.x, br.y - tl.y};
+  }
+};
+
+
+static bool pointInCircle(const Vec2& p, const Vec2& c, double r) {
+  const double dx = p.x - c.x;
+  const double dy = p.y - c.y;
+  return (dx*dx + dy*dy) <= (r*r);
+}
+
+static void drawAgent(const Viewport& vp, const Agent& a, Color fill, Color outline) {
+  Vector2 s = vp.worldToScreen(a.pos);
+  const float rr = (float)(a.radius * vp.scale);
+
+  DrawCircleV(s, rr, fill);
+  DrawCircleLines((int)s.x, (int)s.y, rr, outline);
+
+  // Facing arrow
+  Vec2 f = a.facing.normalized();
+  Vec2 tipW = a.pos + f * (a.radius * 3.0);
+  Vector2 tipS = vp.worldToScreen(tipW);
+  DrawLineEx(s, tipS, 2.0f, outline);
+  DrawCircleV(tipS, 3.0f, outline);
+}
+
+static double raycastRayToAABB(const Vec2& ro, const Vec2& rdUnit, const AABB& b) {
+  // Ray: ro + t*rd, t >= 0
+  // Slab intersection, return nearest hit t, or INF if miss.
+  const double INF = std::numeric_limits<double>::infinity();
+
+  double tmin = 0.0;
+  double tmax = INF;
+
+  auto slab = [&](double roC, double rdC, double minC, double maxC) -> bool {
+    if (std::abs(rdC) < 1e-12) {
+      // Ray parallel to slab: must be inside
+      return (roC >= minC && roC <= maxC);
+    }
+    double t1 = (minC - roC) / rdC;
+    double t2 = (maxC - roC) / rdC;
+    if (t1 > t2) std::swap(t1, t2);
+    tmin = std::max(tmin, t1);
+    tmax = std::min(tmax, t2);
+    return tmin <= tmax;
+  };
+
+  if (!slab(ro.x, rdUnit.x, b.min.x, b.max.x)) return INF;
+  if (!slab(ro.y, rdUnit.y, b.min.y, b.max.y)) return INF;
+
+  // tmin is first intersection (could be 0 if starting inside)
+  if (tmax < 0.0) return INF;       // box is behind ray
+  if (tmin < 0.0) return 0.0;       // ray starts inside box; treat as immediate hit
+  return tmin;
+}
+
+static double raycastToObstacles(const Map& map, const Vec2& origin, const Vec2& dirUnit, double maxRange) {
+  double best = maxRange;
+
+  for (const auto& ob : map.obstacles()) {
+    double t = raycastRayToAABB(origin, dirUnit, ob);
+    if (t >= 0.0 && t < best) best = t;
+  }
+
+  // Optional: clip to world bounds too (prevents cone drawing outside map)
+  // Treat world bounds as a box you raycast against, but we want the INSIDE boundary.
+  // Easiest: just clamp final points by maxRange and let the viewport/world show bounds.
+  return best;
+}
+
+static void drawFovConeOccluded(
+    const Viewport& vp,
+    const Scene& scene,
+    const Agent& a,
+    double fovDeg,
+    double maxRange,
+    Color fill,
+    Color edge)
+{
+  Vec2 f = a.facing.normalized();
+  const double base = std::atan2(f.y, f.x);
+  const double half = (fovDeg * (3.1415926535/ 180.0)) * 0.5;
+
+  const int segments = 60; // higher = smoother + more accurate occlusion
+  std::vector<Vec2> ptsW;
+  ptsW.reserve(segments + 1);
+
+  for (int i = 0; i <= segments; ++i) {
+    const double t = (double)i / (double)segments;
+    const double ang = base - half + (2.0 * half * t);
+
+    Vec2 dir{ std::cos(ang), std::sin(ang) }; // already unit
+    double d = raycastToObstacles(scene.map, a.pos, dir, maxRange);
+    ptsW.push_back(a.pos + dir * d);
+  }
+
+  // Draw filled fan (triangle strip style)
+  Vector2 cS = vp.worldToScreen(a.pos);
+  for (int i = 0; i < segments; ++i) {
+    Vector2 p0S = vp.worldToScreen(ptsW[i]);
+    Vector2 p1S = vp.worldToScreen(ptsW[i + 1]);
+    DrawTriangle(cS, p0S, p1S, fill);
+  }
+
+  // Outline edges
+  DrawLineEx(cS, vp.worldToScreen(ptsW.front()), 2.0f, edge);
+  DrawLineEx(cS, vp.worldToScreen(ptsW.back()), 2.0f, edge);
+
+  // Outline along the clipped arc (optional but looks nice)
+  for (int i = 0; i < segments; ++i) {
+    DrawLineEx(vp.worldToScreen(ptsW[i]), vp.worldToScreen(ptsW[i + 1]), 1.0f, edge);
+  }
+}
+
 
 static int DrawTextWrapped(const std::string& text, int x, int y, int fontSize, int maxWidth, Color color) {
   const int lineHeight = (int)(fontSize * 1.25f);
@@ -102,68 +256,6 @@ static int DrawTextWrapped(const std::string& text, int x, int y, int fontSize, 
 }
 
 
-
-// ---------- World <-> Screen mapping ----------
-struct Viewport {
-  AABB world;
-  int viewW = 840;
-  int viewH = 800;
-  int margin = 40;
-  int x0 = 0;            // left offset of viewport in screen space
-  double scale = 1.0;
-
-  void computeScale() {
-    const double worldW = world.max.x - world.min.x;
-    const double worldH = world.max.y - world.min.y;
-    const double sx = (viewW - 2.0 * margin) / worldW;
-    const double sy = (viewH - 2.0 * margin) / worldH;
-    scale = std::min(sx, sy);
-  }
-
-  bool mouseInView(const Vector2& m) const {
-    return m.x >= x0 && m.x < (x0 + viewW) && m.y >= 0 && m.y < viewH;
-  }
-
-  Vector2 worldToScreen(const Vec2& p) const {
-    const double x = x0 + margin + (p.x - world.min.x) * scale;
-    const double y = margin + (world.max.y - p.y) * scale;
-    return Vector2{(float)x, (float)y};
-  }
-
-  Vec2 screenToWorld(const Vector2& s) const {
-    const double x = world.min.x + (s.x - x0 - margin) / scale;
-    const double y = world.max.y - (s.y - margin) / scale;
-    return Vec2{x, y};
-  }
-
-  Rectangle worldAABBToScreenRect(const AABB& b) const {
-    Vector2 tl = worldToScreen(Vec2{b.min.x, b.max.y});
-    Vector2 br = worldToScreen(Vec2{b.max.x, b.min.y});
-    return Rectangle{tl.x, tl.y, br.x - tl.x, br.y - tl.y};
-  }
-};
-
-
-static bool pointInCircle(const Vec2& p, const Vec2& c, double r) {
-  const double dx = p.x - c.x;
-  const double dy = p.y - c.y;
-  return (dx*dx + dy*dy) <= (r*r);
-}
-
-static void drawAgent(const Viewport& vp, const Agent& a, Color fill, Color outline) {
-  Vector2 s = vp.worldToScreen(a.pos);
-  const float rr = (float)(a.radius * vp.scale);
-
-  DrawCircleV(s, rr, fill);
-  DrawCircleLines((int)s.x, (int)s.y, rr, outline);
-
-  // Facing arrow
-  Vec2 f = a.facing.normalized();
-  Vec2 tipW = a.pos + f * (a.radius * 3.0);
-  Vector2 tipS = vp.worldToScreen(tipW);
-  DrawLineEx(s, tipS, 2.0f, outline);
-  DrawCircleV(tipS, 3.0f, outline);
-}
 
 int main() {
   // --- Window ---
@@ -325,6 +417,12 @@ int main() {
         DrawCircleV(s, ptR, Color{255, 60, 60, 120});
       }
     }
+
+    drawFovConeOccluded(vp, scene, scene.self, 90.0, 8.0,
+                    Color{0, 140, 255, 35}, Color{0, 140, 255, 120});
+
+    drawFovConeOccluded(vp, scene, scene.enemy, 90.0, 8.0,
+                    Color{255, 80, 80, 30}, Color{255, 80, 80, 120});
 
     // Agents
     drawAgent(vp, scene.self, Color{0, 140, 255, 220}, BLUE);
