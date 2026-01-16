@@ -14,6 +14,8 @@ const int W = 1200;
 const int H = 800;
 static const int SIDEBAR_W = 360;
 static const int VIEW_W = W - SIDEBAR_W;
+static const int FOV_SLIDER_Y = 260;
+static const int FOV_SLIDER_H = 16;
 
 
 // ---------- World <-> Screen mapping ----------
@@ -329,6 +331,9 @@ int main() {
   enum class DragMode { None, Self, Enemy, SelfFacing, EnemyFacing };
   DragMode drag = DragMode::None;
 
+
+  double fovDeg = 90.0;   // initial FOV angle
+
   bool showReachSelf = true;
   bool showReachEnemy = true;
 
@@ -346,6 +351,35 @@ int main() {
     // --- Input ---
     Vector2 mouseS = GetMousePosition();
     Vec2 mouseW = vp.screenToWorld(mouseS);
+
+    // ---- FOV slider input ----
+    static bool draggingFov = false;
+
+    Rectangle fovTrack{
+      (float)(VIEW_W + 16),
+      (float)FOV_SLIDER_Y,
+      (float)(SIDEBAR_W - 32),
+      (float)FOV_SLIDER_H
+    };
+
+    bool mouseOnFov =
+      CheckCollisionPointRec(mouseS, fovTrack);
+
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && mouseOnFov) {
+      draggingFov = true;
+    }
+
+    if (IsMouseButtonDown(MOUSE_LEFT_BUTTON) && draggingFov) {
+      float t = (mouseS.x - fovTrack.x) / fovTrack.width;
+      t = std::clamp(t, 0.0f, 1.0f);
+      fovDeg = 5.0 + t * (360.0 - 5.0);
+      dirty = true;
+    }
+
+    if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+      draggingFov = false;
+    }
+
 
     const double selfHandleDist  = scene.self.radius * 4.0;
     const double enemyHandleDist = scene.enemy.radius * 4.0;
@@ -477,11 +511,26 @@ int main() {
       }
     }
 
-    drawFovConeOccluded(vp, scene, scene.self, 90.0, 8.0,
-                    Color{0, 140, 255, 35}, Color{0, 140, 255, 120});
+    drawFovConeOccluded(
+      vp,
+      scene,
+      scene.self,
+      fovDeg,
+      8.0,
+      Color{0,140,255,35},
+      Color{0,140,255,120}
+    );
 
-    drawFovConeOccluded(vp, scene, scene.enemy, 90.0, 8.0,
-                    Color{255, 80, 80, 30}, Color{255, 80, 80, 120});
+    drawFovConeOccluded(
+      vp,
+      scene,
+      scene.enemy,
+      fovDeg,
+      8.0,
+      Color{255,80,80,30},
+      Color{255,80,80,120}
+    );
+
 
     // Agents
     drawAgent(vp, scene.self, Color{0, 140, 255, 220}, BLUE);
@@ -491,7 +540,9 @@ int main() {
 
 
     // HUD
-    int x = VIEW_W + 16, y = 20;
+    int x = VIEW_W + 16;
+    int y = 20;
+
     DrawText("Controls:", x, y, 18, BLACK); y += 22;
     DrawText("  Drag agents with LMB", x, y, 16, DARKGRAY); y += 18;
     DrawText("  LMB drag empty space: create obstacle", x, y, 16, DARKGRAY); y += 18;
@@ -499,6 +550,27 @@ int main() {
     DrawText("  , / . : cellSize down/up", x, y, 16, DARKGRAY); y += 18;
     DrawText("  1: toggle self reachable", x, y, 16, DARKGRAY); y += 18;
     DrawText("  2: toggle enemy reachable", x, y, 16, DARKGRAY); y += 26;
+    y = std::max(y, FOV_SLIDER_Y + 60);
+    // ---- FOV slider UI ----
+    DrawText("Field of View (deg)", VIEW_W + 16, FOV_SLIDER_Y - 22, 16, BLACK);
+
+    // Track
+    DrawRectangleRec(fovTrack, LIGHTGRAY);
+    DrawRectangleLinesEx(fovTrack, 1, DARKGRAY);
+
+    // Knob
+    float knobT = (float)((fovDeg - 5.0) / (360.0 - 5.0));
+    float knobX = fovTrack.x + knobT * fovTrack.width;
+
+    DrawCircle((int)knobX, (int)(fovTrack.y + fovTrack.height / 2), 7, DARKBLUE);
+
+    // Value label
+    DrawText(TextFormat("%.0f°", fovDeg),
+            VIEW_W + 16,
+            FOV_SLIDER_Y + 24,
+            16,
+            DARKGRAY);
+
 
 
     {
