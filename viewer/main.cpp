@@ -63,6 +63,23 @@ static bool pointInCircle(const Vec2& p, const Vec2& c, double r) {
   return (dx*dx + dy*dy) <= (r*r);
 }
 
+static void drawFacingHandle(const Viewport& vp, const Agent& a, bool hovered) {
+  const double handleDist = a.radius * 4.0;
+  Vec2 f = a.facing.normalized();
+  Vec2 handleW = a.pos + f * handleDist;
+  Vector2 handleS = vp.worldToScreen(handleW);
+
+  Color fill = hovered ? ORANGE : YELLOW;
+  Color outline = hovered ? RED : ORANGE;
+
+  DrawCircleV(handleS, 6.0f, fill);
+  DrawCircleLines((int)handleS.x, (int)handleS.y, 6.0f, outline);
+}
+
+static Vec2 facingHandlePos(const Agent& a, double handleDist) {
+  return a.pos + a.facing.normalized() * handleDist;
+}
+
 static void drawAgent(const Viewport& vp, const Agent& a, Color fill, Color outline) {
   Vector2 s = vp.worldToScreen(a.pos);
   const float rr = (float)(a.radius * vp.scale);
@@ -76,7 +93,20 @@ static void drawAgent(const Viewport& vp, const Agent& a, Color fill, Color outl
   Vector2 tipS = vp.worldToScreen(tipW);
   DrawLineEx(s, tipS, 2.0f, outline);
   DrawCircleV(tipS, 3.0f, outline);
+  Vec2 handleW = facingHandlePos(a, a.radius * 4.0);
+  Vector2 handleS = vp.worldToScreen(handleW);
+
+  DrawCircleV(handleS, 6.0f, YELLOW);
+  DrawCircleLines((int)handleS.x, (int)handleS.y, 6.0f, ORANGE);
+
 }
+
+static bool hitFacingHandle(const Vec2& mouseW, const Agent& a, double handleDist, double hitRadiusW) {
+  Vec2 h = facingHandlePos(a, handleDist);
+  return pointInCircle(mouseW, h, hitRadiusW);
+}
+
+
 
 static double raycastRayToAABB(const Vec2& ro, const Vec2& rdUnit, const AABB& b) {
   // Ray: ro + t*rd, t >= 0
@@ -296,7 +326,7 @@ int main() {
   bool dirty = true;
 
   // --- Interaction state ---
-  enum class DragMode { None, Self, Enemy };
+  enum class DragMode { None, Self, Enemy, SelfFacing, EnemyFacing };
   DragMode drag = DragMode::None;
 
   bool showReachSelf = true;
@@ -317,6 +347,16 @@ int main() {
     Vector2 mouseS = GetMousePosition();
     Vec2 mouseW = vp.screenToWorld(mouseS);
 
+    const double selfHandleDist  = scene.self.radius * 4.0;
+    const double enemyHandleDist = scene.enemy.radius * 4.0;
+    const double handleHitR      = scene.self.radius * 1.5;
+
+    bool hoverSelfFacing =
+    hitFacingHandle(mouseW, scene.self, selfHandleDist, handleHitR);
+
+    bool hoverEnemyFacing =
+    hitFacingHandle(mouseW, scene.enemy, enemyHandleDist, handleHitR);
+
     // Toggles
     if (IsKeyPressed(KEY_ONE)) { showReachSelf = !showReachSelf; }
     if (IsKeyPressed(KEY_TWO)) { showReachEnemy = !showReachEnemy; }
@@ -331,19 +371,31 @@ int main() {
     
     const bool inView = vp.mouseInView(mouseS);
 
-    // Drag self/enemy with left mouse
+// Drag with left mouse (handles > bodies > obstacle)
     if (inView && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-      // Prefer grabbing agents first
-      if (pointInCircle(mouseW, scene.self.pos, scene.self.radius * 1.8)) {
+      const double selfHandleDist = scene.self.radius * 4.0;
+      const double enemyHandleDist = scene.enemy.radius * 4.0;
+      const double handleHitR = std::max(scene.self.radius, scene.enemy.radius) * 1.5; // easy to grab
+
+      // 1) Facing handles first
+      if (hitFacingHandle(mouseW, scene.self, selfHandleDist, handleHitR)) {
+        drag = DragMode::SelfFacing;
+      } else if (hitFacingHandle(mouseW, scene.enemy, enemyHandleDist, handleHitR)) {
+        drag = DragMode::EnemyFacing;
+
+      // 2) Then agent bodies
+      } else if (pointInCircle(mouseW, scene.self.pos, scene.self.radius * 1.8)) {
         drag = DragMode::Self;
       } else if (pointInCircle(mouseW, scene.enemy.pos, scene.enemy.radius * 1.8)) {
         drag = DragMode::Enemy;
+
+      // 3) Otherwise start making a new obstacle
       } else {
-        // Start making a new obstacle
         makingObstacle = true;
         obsStartW = mouseW;
       }
     }
+
 
     if (inView && IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
       if (drag == DragMode::Self) {
@@ -352,8 +404,15 @@ int main() {
       } else if (drag == DragMode::Enemy) {
         scene.enemy.pos = mouseW;
         dirty = true;
+      } else if (drag == DragMode::SelfFacing) {
+        Vec2 d = mouseW - scene.self.pos;
+        if (d.norm() > 1e-6) { scene.self.facing = d.normalized(); dirty = true; }
+      } else if (drag == DragMode::EnemyFacing) {
+        Vec2 d = mouseW - scene.enemy.pos;
+        if (d.norm() > 1e-6) { scene.enemy.facing = d.normalized(); dirty = true; }
       }
     }
+
 
     if (inView && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
       if (makingObstacle) {
@@ -427,6 +486,9 @@ int main() {
     // Agents
     drawAgent(vp, scene.self, Color{0, 140, 255, 220}, BLUE);
     drawAgent(vp, scene.enemy, Color{255, 80, 80, 220}, MAROON);
+    drawFacingHandle(vp, scene.self, hoverSelfFacing);
+    drawFacingHandle(vp, scene.enemy, hoverEnemyFacing);
+
 
     // HUD
     int x = VIEW_W + 16, y = 20;
