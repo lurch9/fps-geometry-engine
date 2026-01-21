@@ -19,6 +19,12 @@ public:
 
   bool collidesCircleAt(const Vec2& center, double radius) const;
 
+    // Editor helpers (viewer needs to mutate obstacles)
+  std::vector<AABB>& obstaclesMutable() { return obstacles_; }
+  void removeObstacle(size_t i) { obstacles_.erase(obstacles_.begin() + i); }
+  void setObstacle(size_t i, const AABB& b) { obstacles_[i] = b; }
+
+
 private:
   AABB worldBounds_{Vec2{0,0}, Vec2{10,10}};
   std::vector<AABB> obstacles_;

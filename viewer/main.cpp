@@ -1,24 +1,33 @@
 #include <raylib.h>
+
 #include <algorithm>
 #include <cmath>
-#include <string>
-#include <cstring>
 #include <limits>
+#include <string>
+#include <vector>
 
 #include "core/Scene.hpp"
 #include "analysis/SceneAnalyzer.hpp"
 #include "geom/AABB.hpp"
 #include "geom/Vec2.hpp"
 
-const int W = 1200;
-const int H = 800;
+// ====================== Constants ======================
+static const int W = 1200;
+static const int H = 800;
+
 static const int SIDEBAR_W = 360;
 static const int VIEW_W = W - SIDEBAR_W;
+
 static const int FOV_SLIDER_Y = 260;
 static const int FOV_SLIDER_H = 16;
 
+static const double FOV_MIN = 5.0;
+static const double FOV_MAX = 360.0;
 
-// ---------- World <-> Screen mapping ----------
+static const double OB_MIN_SIZE = 0.10; // world units
+
+
+// ====================== World <-> Screen mapping ======================
 struct Viewport {
   AABB world;
   int viewW = 840;
@@ -59,12 +68,112 @@ struct Viewport {
 };
 
 
+// ====================== Editor types ======================
+enum class DragMode {
+  None,
+  Self,
+  Enemy,
+  SelfFacing,
+  EnemyFacing,
+  ObstacleMove,
+  ObstacleResize
+};
+
+enum class Handle {
+  None, TL, TR, BL, BR
+};
+
+
+// ====================== Small helpers ======================
 static bool pointInCircle(const Vec2& p, const Vec2& c, double r) {
   const double dx = p.x - c.x;
   const double dy = p.y - c.y;
   return (dx*dx + dy*dy) <= (r*r);
 }
 
+static bool aabbContains(const AABB& b, const Vec2& p) {
+  return p.x >= b.min.x && p.x <= b.max.x && p.y >= b.min.y && p.y <= b.max.y;
+}
+
+static AABB normalizeAABB(AABB b) {
+  if (b.min.x > b.max.x) std::swap(b.min.x, b.max.x);
+  if (b.min.y > b.max.y) std::swap(b.min.y, b.max.y);
+  return b;
+}
+
+static AABB clampAABBToWorld(AABB b, const AABB& world, double minSize) {
+  b = normalizeAABB(b);
+
+  b.min.x = std::clamp(b.min.x, world.min.x, world.max.x);
+  b.max.x = std::clamp(b.max.x, world.min.x, world.max.x);
+  b.min.y = std::clamp(b.min.y, world.min.y, world.max.y);
+  b.max.y = std::clamp(b.max.y, world.min.y, world.max.y);
+
+  // enforce min size (expand max side preferentially)
+  if ((b.max.x - b.min.x) < minSize) b.max.x = std::min(world.max.x, b.min.x + minSize);
+  if ((b.max.y - b.min.y) < minSize) b.max.y = std::min(world.max.y, b.min.y + minSize);
+
+  b = normalizeAABB(b);
+
+  // final clamp
+  b.min.x = std::clamp(b.min.x, world.min.x, world.max.x);
+  b.max.x = std::clamp(b.max.x, world.min.x, world.max.x);
+  b.min.y = std::clamp(b.min.y, world.min.y, world.max.y);
+  b.max.y = std::clamp(b.max.y, world.min.y, world.max.y);
+
+  return b;
+}
+
+static int pickObstacle(const std::vector<AABB>& obs, const Vec2& mouseW) {
+  for (int i = (int)obs.size() - 1; i >= 0; --i) {
+    if (aabbContains(obs[i], mouseW)) return i;
+  }
+  return -1;
+}
+
+static Vec2 handlePos(const AABB& b, Handle h) {
+  switch (h) {
+    case Handle::TL: return Vec2{b.min.x, b.max.y};
+    case Handle::TR: return Vec2{b.max.x, b.max.y};
+    case Handle::BL: return Vec2{b.min.x, b.min.y};
+    case Handle::BR: return Vec2{b.max.x, b.min.y};
+    default: return Vec2{0,0};
+  }
+}
+
+static Handle pickHandle(const AABB& b, const Vec2& mouseW, double rWorld) {
+  const Handle hs[] = {Handle::TL, Handle::TR, Handle::BL, Handle::BR};
+  for (Handle h : hs) {
+    if (pointInCircle(mouseW, handlePos(b, h), rWorld)) return h;
+  }
+  return Handle::None;
+}
+
+static AABB resizedAABB(const AABB& start, Handle h, const Vec2& mouseW) {
+  AABB b = start;
+  switch (h) {
+    case Handle::TL: b.min.x = mouseW.x; b.max.y = mouseW.y; break;
+    case Handle::TR: b.max.x = mouseW.x; b.max.y = mouseW.y; break;
+    case Handle::BL: b.min.x = mouseW.x; b.min.y = mouseW.y; break;
+    case Handle::BR: b.max.x = mouseW.x; b.min.y = mouseW.y; break;
+    default: break;
+  }
+  return normalizeAABB(b);
+}
+
+
+// ====================== Facing handle helpers ======================
+static Vec2 facingHandlePos(const Agent& a, double handleDist) {
+  return a.pos + a.facing.normalized() * handleDist;
+}
+
+static bool hitFacingHandle(const Vec2& mouseW, const Agent& a, double handleDist, double hitRadiusW) {
+  Vec2 h = facingHandlePos(a, handleDist);
+  return pointInCircle(mouseW, h, hitRadiusW);
+}
+
+
+// ====================== Drawing helpers ======================
 static void drawFacingHandle(const Viewport& vp, const Agent& a, bool hovered) {
   const double handleDist = a.radius * 4.0;
   Vec2 f = a.facing.normalized();
@@ -76,10 +185,6 @@ static void drawFacingHandle(const Viewport& vp, const Agent& a, bool hovered) {
 
   DrawCircleV(handleS, 6.0f, fill);
   DrawCircleLines((int)handleS.x, (int)handleS.y, 6.0f, outline);
-}
-
-static Vec2 facingHandlePos(const Agent& a, double handleDist) {
-  return a.pos + a.facing.normalized() * handleDist;
 }
 
 static void drawAgent(const Viewport& vp, const Agent& a, Color fill, Color outline) {
@@ -95,24 +200,20 @@ static void drawAgent(const Viewport& vp, const Agent& a, Color fill, Color outl
   Vector2 tipS = vp.worldToScreen(tipW);
   DrawLineEx(s, tipS, 2.0f, outline);
   DrawCircleV(tipS, 3.0f, outline);
-  Vec2 handleW = facingHandlePos(a, a.radius * 4.0);
-  Vector2 handleS = vp.worldToScreen(handleW);
-
-  DrawCircleV(handleS, 6.0f, YELLOW);
-  DrawCircleLines((int)handleS.x, (int)handleS.y, 6.0f, ORANGE);
-
 }
 
-static bool hitFacingHandle(const Vec2& mouseW, const Agent& a, double handleDist, double hitRadiusW) {
-  Vec2 h = facingHandlePos(a, handleDist);
-  return pointInCircle(mouseW, h, hitRadiusW);
+static void drawObstacleHandles(const Viewport& vp, const AABB& ob) {
+  const Handle hs[] = {Handle::TL, Handle::TR, Handle::BL, Handle::BR};
+  for (Handle h : hs) {
+    Vector2 pS = vp.worldToScreen(handlePos(ob, h));
+    DrawCircleV(pS, 6.0f, YELLOW);
+    DrawCircleLines((int)pS.x, (int)pS.y, 6.0f, ORANGE);
+  }
 }
 
 
-
+// ====================== FOV occlusion raycasting + drawing ======================
 static double raycastRayToAABB(const Vec2& ro, const Vec2& rdUnit, const AABB& b) {
-  // Ray: ro + t*rd, t >= 0
-  // Slab intersection, return nearest hit t, or INF if miss.
   const double INF = std::numeric_limits<double>::infinity();
 
   double tmin = 0.0;
@@ -120,7 +221,6 @@ static double raycastRayToAABB(const Vec2& ro, const Vec2& rdUnit, const AABB& b
 
   auto slab = [&](double roC, double rdC, double minC, double maxC) -> bool {
     if (std::abs(rdC) < 1e-12) {
-      // Ray parallel to slab: must be inside
       return (roC >= minC && roC <= maxC);
     }
     double t1 = (minC - roC) / rdC;
@@ -134,9 +234,8 @@ static double raycastRayToAABB(const Vec2& ro, const Vec2& rdUnit, const AABB& b
   if (!slab(ro.x, rdUnit.x, b.min.x, b.max.x)) return INF;
   if (!slab(ro.y, rdUnit.y, b.min.y, b.max.y)) return INF;
 
-  // tmin is first intersection (could be 0 if starting inside)
-  if (tmax < 0.0) return INF;       // box is behind ray
-  if (tmin < 0.0) return 0.0;       // ray starts inside box; treat as immediate hit
+  if (tmax < 0.0) return INF;
+  if (tmin < 0.0) return 0.0;
   return tmin;
 }
 
@@ -147,10 +246,6 @@ static double raycastToObstacles(const Map& map, const Vec2& origin, const Vec2&
     double t = raycastRayToAABB(origin, dirUnit, ob);
     if (t >= 0.0 && t < best) best = t;
   }
-
-  // Optional: clip to world bounds too (prevents cone drawing outside map)
-  // Treat world bounds as a box you raycast against, but we want the INSIDE boundary.
-  // Easiest: just clamp final points by maxRange and let the viewport/world show bounds.
   return best;
 }
 
@@ -167,7 +262,7 @@ static void drawFovConeOccluded(
   const double base = std::atan2(f.y, f.x);
   const double half = (fovDeg * (3.1415926535/ 180.0)) * 0.5;
 
-  const int segments = 60; // higher = smoother + more accurate occlusion
+  const int segments = 60;
   std::vector<Vec2> ptsW;
   ptsW.reserve(segments + 1);
 
@@ -175,30 +270,30 @@ static void drawFovConeOccluded(
     const double t = (double)i / (double)segments;
     const double ang = base - half + (2.0 * half * t);
 
-    Vec2 dir{ std::cos(ang), std::sin(ang) }; // already unit
+    Vec2 dir{ std::cos(ang), std::sin(ang) };
     double d = raycastToObstacles(scene.map, a.pos, dir, maxRange);
     ptsW.push_back(a.pos + dir * d);
   }
 
-  // Draw filled fan (triangle strip style)
   Vector2 cS = vp.worldToScreen(a.pos);
+
+  // fill
   for (int i = 0; i < segments; ++i) {
     Vector2 p0S = vp.worldToScreen(ptsW[i]);
     Vector2 p1S = vp.worldToScreen(ptsW[i + 1]);
     DrawTriangle(cS, p0S, p1S, fill);
   }
 
-  // Outline edges
+  // edges
   DrawLineEx(cS, vp.worldToScreen(ptsW.front()), 2.0f, edge);
   DrawLineEx(cS, vp.worldToScreen(ptsW.back()), 2.0f, edge);
-
-  // Outline along the clipped arc (optional but looks nice)
   for (int i = 0; i < segments; ++i) {
     DrawLineEx(vp.worldToScreen(ptsW[i]), vp.worldToScreen(ptsW[i + 1]), 1.0f, edge);
   }
 }
 
 
+// ====================== UI helpers ======================
 static int DrawTextWrapped(const std::string& text, int x, int y, int fontSize, int maxWidth, Color color) {
   const int lineHeight = (int)(fontSize * 1.25f);
 
@@ -215,21 +310,16 @@ static int DrawTextWrapped(const std::string& text, int x, int y, int fontSize, 
     }
   };
 
-  // Split on spaces and build lines
   size_t i = 0;
   while (i < text.size()) {
-    // Skip leading spaces
     while (i < text.size() && text[i] == ' ') i++;
     if (i >= text.size()) break;
 
-    // Read next word
     size_t start = i;
     while (i < text.size() && text[i] != ' ') i++;
     std::string word = text.substr(start, i - start);
 
-    // Handle explicit newlines in the input (optional)
     if (word.find('\n') != std::string::npos) {
-      // naive: split at '\n'
       size_t pos = 0;
       while (true) {
         size_t nl = word.find('\n', pos);
@@ -249,16 +339,13 @@ static int DrawTextWrapped(const std::string& text, int x, int y, int fontSize, 
       continue;
     }
 
-    // Try to append word to current line
     std::string candidate = line.empty() ? word : (line + " " + word);
 
     if (MeasureText(candidate.c_str(), fontSize) <= maxWidth) {
       line = candidate;
     } else {
-      // Current line full: flush and start new line with word
       flushLine();
 
-      // If a single word is longer than maxWidth, hard-break it
       if (MeasureText(word.c_str(), fontSize) > maxWidth) {
         std::string chunk;
         for (char c : word) {
@@ -282,19 +369,16 @@ static int DrawTextWrapped(const std::string& text, int x, int y, int fontSize, 
   }
 
   flushLine();
-
-  // Return pixels consumed vertically
   return yCursor - y;
 }
 
 
-
+// ====================== main() ======================
 int main() {
-  // --- Window ---
   InitWindow(W, H, "FPS Geometry Engine - raylib viewer");
   SetTargetFPS(60);
 
-  // --- Scene (start with a reasonable default) ---
+  // --- Scene ---
   Scene scene;
   scene.map.setWorldBounds(AABB{Vec2{0,0}, Vec2{10,10}});
   scene.T = 0.30;
@@ -314,124 +398,146 @@ int main() {
   // --- Viewport ---
   Viewport vp;
   vp.world = scene.map.worldBounds();
-    vp.viewW = VIEW_W;  // left side only
-    vp.viewH = H;
-    vp.x0 = 0;
-    vp.computeScale();
+  vp.viewW = VIEW_W;
+  vp.viewH = H;
+  vp.x0 = 0;
+  vp.computeScale();
 
-
-  
-
-  // --- Analyzer state ---
+  // --- Analyzer ---
   SceneAnalyzer analyzer;
   AnalysisResult result;
   bool dirty = true;
 
-  // --- Interaction state ---
-  enum class DragMode { None, Self, Enemy, SelfFacing, EnemyFacing };
-  DragMode drag = DragMode::None;
-
-
-  double fovDeg = 90.0;   // initial FOV angle
-
+  // --- Viewer toggles ---
   bool showReachSelf = true;
   bool showReachEnemy = true;
 
-  // Obstacle creation (click-drag in empty space)
+  // --- UI state ---
+  double fovDeg = 90.0;
+  bool draggingFov = false;
+
+  // --- Obstacle creation ---
   bool makingObstacle = false;
-  Vec2 obsStartW;
+  Vec2 obsStartW{};
+
+  // --- Editor state (selection/drag/resize) ---
+  int selectedObstacle = -1;
+  DragMode drag = DragMode::None;
+  Handle activeHandle = Handle::None;
+  Vec2 dragStartMouseW{};
+  AABB dragStartOb{};
 
   while (!WindowShouldClose()) {
-    // Recompute analysis only when something changed
+    // ====================== Analyze (on demand) ======================
     if (dirty) {
       result = analyzer.analyze(scene);
       dirty = false;
     }
 
-    // --- Input ---
+    // ====================== Input ======================
     Vector2 mouseS = GetMousePosition();
     Vec2 mouseW = vp.screenToWorld(mouseS);
+    const bool inView = vp.mouseInView(mouseS);
 
-    // ---- FOV slider input ----
-    static bool draggingFov = false;
-
+    // --- FOV slider rect is needed for BOTH input + draw ---
     Rectangle fovTrack{
       (float)(VIEW_W + 16),
       (float)FOV_SLIDER_Y,
       (float)(SIDEBAR_W - 32),
       (float)FOV_SLIDER_H
     };
+    const bool mouseOnFov = CheckCollisionPointRec(mouseS, fovTrack);
 
-    bool mouseOnFov =
-      CheckCollisionPointRec(mouseS, fovTrack);
+    // toggles
+    if (IsKeyPressed(KEY_ONE)) { showReachSelf = !showReachSelf; }
+    if (IsKeyPressed(KEY_TWO)) { showReachEnemy = !showReachEnemy; }
 
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && mouseOnFov) {
-      draggingFov = true;
-    }
+    // param tweaks
+    if (IsKeyPressed(KEY_LEFT_BRACKET))  { scene.T = std::max(0.05, scene.T - 0.05); dirty = true; }
+    if (IsKeyPressed(KEY_RIGHT_BRACKET)) { scene.T = std::min(2.00, scene.T + 0.05); dirty = true; }
 
-    if (IsMouseButtonDown(MOUSE_LEFT_BUTTON) && draggingFov) {
-      float t = (mouseS.x - fovTrack.x) / fovTrack.width;
-      t = std::clamp(t, 0.0f, 1.0f);
-      fovDeg = 5.0 + t * (360.0 - 5.0);
+    if (IsKeyPressed(KEY_COMMA))  { scene.cellSize = std::max(0.10, scene.cellSize - 0.10); dirty = true; }
+    if (IsKeyPressed(KEY_PERIOD)) { scene.cellSize = std::min(2.00, scene.cellSize + 0.10); dirty = true; }
+
+    // delete selected obstacle
+    if (selectedObstacle >= 0 && (IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE))) {
+      scene.map.removeObstacle((size_t)selectedObstacle);
+      selectedObstacle = -1;
       dirty = true;
     }
 
+    // ---- Slider input (takes priority in sidebar) ----
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && mouseOnFov) {
+      draggingFov = true;
+    }
+    if (IsMouseButtonDown(MOUSE_LEFT_BUTTON) && draggingFov) {
+      float t = (mouseS.x - fovTrack.x) / fovTrack.width;
+      t = std::clamp(t, 0.0f, 1.0f);
+      fovDeg = FOV_MIN + t * (FOV_MAX - FOV_MIN);
+      dirty = true;
+    }
     if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
       draggingFov = false;
     }
 
-
+    // Facing handle hover
     const double selfHandleDist  = scene.self.radius * 4.0;
     const double enemyHandleDist = scene.enemy.radius * 4.0;
-    const double handleHitR      = scene.self.radius * 1.5;
+    const double handleHitR      = std::max(scene.self.radius, scene.enemy.radius) * 1.5;
 
-    bool hoverSelfFacing =
-    hitFacingHandle(mouseW, scene.self, selfHandleDist, handleHitR);
+    bool hoverSelfFacing = hitFacingHandle(mouseW, scene.self, selfHandleDist, handleHitR);
+    bool hoverEnemyFacing = hitFacingHandle(mouseW, scene.enemy, enemyHandleDist, handleHitR);
 
-    bool hoverEnemyFacing =
-    hitFacingHandle(mouseW, scene.enemy, enemyHandleDist, handleHitR);
+    // ---- Main editor input (viewport only, and not while slider dragging) ----
+    if (inView && !draggingFov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+      // Priority: facing handles -> agent bodies -> obstacle handles -> obstacle body -> create obstacle
 
-    // Toggles
-    if (IsKeyPressed(KEY_ONE)) { showReachSelf = !showReachSelf; }
-    if (IsKeyPressed(KEY_TWO)) { showReachEnemy = !showReachEnemy; }
-
-    // Simple T adjustments
-    if (IsKeyPressed(KEY_LEFT_BRACKET)) { scene.T = std::max(0.05, scene.T - 0.05); dirty = true; }
-    if (IsKeyPressed(KEY_RIGHT_BRACKET)) { scene.T = std::min(2.00, scene.T + 0.05); dirty = true; }
-
-    // Simple cellSize adjustments
-    if (IsKeyPressed(KEY_COMMA)) { scene.cellSize = std::max(0.10, scene.cellSize - 0.10); dirty = true; }
-    if (IsKeyPressed(KEY_PERIOD)) { scene.cellSize = std::min(2.00, scene.cellSize + 0.10); dirty = true; }
-    
-    const bool inView = vp.mouseInView(mouseS);
-
-// Drag with left mouse (handles > bodies > obstacle)
-    if (inView && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-      const double selfHandleDist = scene.self.radius * 4.0;
-      const double enemyHandleDist = scene.enemy.radius * 4.0;
-      const double handleHitR = std::max(scene.self.radius, scene.enemy.radius) * 1.5; // easy to grab
-
-      // 1) Facing handles first
+      // 1) facing handles
       if (hitFacingHandle(mouseW, scene.self, selfHandleDist, handleHitR)) {
         drag = DragMode::SelfFacing;
       } else if (hitFacingHandle(mouseW, scene.enemy, enemyHandleDist, handleHitR)) {
         drag = DragMode::EnemyFacing;
 
-      // 2) Then agent bodies
+      // 2) agent bodies
       } else if (pointInCircle(mouseW, scene.self.pos, scene.self.radius * 1.8)) {
         drag = DragMode::Self;
       } else if (pointInCircle(mouseW, scene.enemy.pos, scene.enemy.radius * 1.8)) {
         drag = DragMode::Enemy;
 
-      // 3) Otherwise start making a new obstacle
       } else {
-        makingObstacle = true;
-        obsStartW = mouseW;
+        // 3) obstacle resize handles (only if something selected)
+        const double handlePickR = std::max(scene.cellSize * 0.35, 0.08); // world units
+        if (selectedObstacle >= 0 && selectedObstacle < (int)scene.map.obstacles().size()) {
+          const AABB& ob = scene.map.obstacles()[selectedObstacle];
+          Handle h = pickHandle(ob, mouseW, handlePickR);
+          if (h != Handle::None) {
+            drag = DragMode::ObstacleResize;
+            activeHandle = h;
+            dragStartMouseW = mouseW;
+            dragStartOb = ob;
+          }
+        }
+
+        // 4) obstacle body move
+        if (drag == DragMode::None) {
+          int idx = pickObstacle(scene.map.obstacles(), mouseW);
+          if (idx >= 0) {
+            selectedObstacle = idx;
+            drag = DragMode::ObstacleMove;
+            dragStartMouseW = mouseW;
+            dragStartOb = scene.map.obstacles()[idx];
+          } else {
+            // 5) create new obstacle
+            selectedObstacle = -1;
+            makingObstacle = true;
+            obsStartW = mouseW;
+          }
+        }
       }
     }
 
-
-    if (inView && IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
+    // ====================== Update (dragging) ======================
+    if (inView && !draggingFov && IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
       if (drag == DragMode::Self) {
         scene.self.pos = mouseW;
         dirty = true;
@@ -444,47 +550,65 @@ int main() {
       } else if (drag == DragMode::EnemyFacing) {
         Vec2 d = mouseW - scene.enemy.pos;
         if (d.norm() > 1e-6) { scene.enemy.facing = d.normalized(); dirty = true; }
+      } else if (drag == DragMode::ObstacleMove && selectedObstacle >= 0) {
+        Vec2 delta = mouseW - dragStartMouseW;
+        AABB moved = dragStartOb;
+        moved.min = moved.min + delta;
+        moved.max = moved.max + delta;
+        moved = clampAABBToWorld(moved, scene.map.worldBounds(), OB_MIN_SIZE);
+        scene.map.setObstacle((size_t)selectedObstacle, moved);
+        dirty = true;
+      } else if (drag == DragMode::ObstacleResize && selectedObstacle >= 0) {
+        AABB resized = resizedAABB(dragStartOb, activeHandle, mouseW);
+        resized = clampAABBToWorld(resized, scene.map.worldBounds(), OB_MIN_SIZE);
+        scene.map.setObstacle((size_t)selectedObstacle, resized);
+        dirty = true;
       }
     }
 
-
-    if (inView && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+    // finish obstacle creation / release drag
+    if (inView && !draggingFov && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
       if (makingObstacle) {
         makingObstacle = false;
 
-        Vec2 a = obsStartW;
-        Vec2 b = mouseW;
-
-        // normalize min/max
         AABB ob;
-        ob.min = Vec2{ std::min(a.x, b.x), std::min(a.y, b.y) };
-        ob.max = Vec2{ std::max(a.x, b.x), std::max(a.y, b.y) };
+        ob.min = Vec2{ std::min(obsStartW.x, mouseW.x), std::min(obsStartW.y, mouseW.y) };
+        ob.max = Vec2{ std::max(obsStartW.x, mouseW.x), std::max(obsStartW.y, mouseW.y) };
+        ob = clampAABBToWorld(ob, scene.map.worldBounds(), OB_MIN_SIZE);
 
-        // Ignore tiny drags
-        if ((ob.max.x - ob.min.x) > 0.1 && (ob.max.y - ob.min.y) > 0.1) {
+        if ((ob.max.x - ob.min.x) > OB_MIN_SIZE && (ob.max.y - ob.min.y) > OB_MIN_SIZE) {
           scene.map.addObstacle(ob);
           dirty = true;
         }
       }
+
       drag = DragMode::None;
+      activeHandle = Handle::None;
     }
 
-    // --- Draw ---
+    // ====================== Draw ======================
     BeginDrawing();
     ClearBackground(RAYWHITE);
+
+    // Sidebar background
     Rectangle sidebar{ (float)VIEW_W, 0, (float)SIDEBAR_W, (float)H };
     DrawRectangleRec(sidebar, Color{245,245,245,255});
     DrawRectangleLinesEx(sidebar, 1, LIGHTGRAY);
 
-
     // World bounds
     DrawRectangleLinesEx(vp.worldAABBToScreenRect(scene.map.worldBounds()), 2, DARKGRAY);
 
-    // Obstacles
-    for (const auto& ob : scene.map.obstacles()) {
+    // Obstacles + selection
+    for (int i = 0; i < (int)scene.map.obstacles().size(); ++i) {
+      const auto& ob = scene.map.obstacles()[i];
       Rectangle r = vp.worldAABBToScreenRect(ob);
       DrawRectangleRec(r, Color{60, 60, 60, 255});
       DrawRectangleLinesEx(r, 1, BLACK);
+
+      if (i == selectedObstacle) {
+        DrawRectangleLinesEx(r, 3, YELLOW);
+        drawObstacleHandles(vp, ob);
+      }
     }
 
     // Preview obstacle while creating
@@ -492,6 +616,8 @@ int main() {
       AABB preview;
       preview.min = Vec2{ std::min(obsStartW.x, mouseW.x), std::min(obsStartW.y, mouseW.y) };
       preview.max = Vec2{ std::max(obsStartW.x, mouseW.x), std::max(obsStartW.y, mouseW.y) };
+      preview = clampAABBToWorld(preview, scene.map.worldBounds(), OB_MIN_SIZE);
+
       Rectangle r = vp.worldAABBToScreenRect(preview);
       DrawRectangleLinesEx(r, 2, RED);
     }
@@ -511,70 +637,48 @@ int main() {
       }
     }
 
-    drawFovConeOccluded(
-      vp,
-      scene,
-      scene.self,
-      fovDeg,
-      8.0,
-      Color{0,140,255,35},
-      Color{0,140,255,120}
-    );
+    // FOV cones
+    drawFovConeOccluded(vp, scene, scene.self,  fovDeg, 8.0, Color{0,140,255,35},   Color{0,140,255,120});
+    drawFovConeOccluded(vp, scene, scene.enemy, fovDeg, 8.0, Color{255,80,80,30},   Color{255,80,80,120});
 
-    drawFovConeOccluded(
-      vp,
-      scene,
-      scene.enemy,
-      fovDeg,
-      8.0,
-      Color{255,80,80,30},
-      Color{255,80,80,120}
-    );
-
-
-    // Agents
-    drawAgent(vp, scene.self, Color{0, 140, 255, 220}, BLUE);
+    // Agents + facing handles
+    drawAgent(vp, scene.self,  Color{0, 140, 255, 220}, BLUE);
     drawAgent(vp, scene.enemy, Color{255, 80, 80, 220}, MAROON);
     drawFacingHandle(vp, scene.self, hoverSelfFacing);
     drawFacingHandle(vp, scene.enemy, hoverEnemyFacing);
 
-
-    // HUD
+    // ---- Sidebar HUD ----
     int x = VIEW_W + 16;
     int y = 20;
 
     DrawText("Controls:", x, y, 18, BLACK); y += 22;
-    DrawText("  Drag agents with LMB", x, y, 16, DARKGRAY); y += 18;
+    DrawText("  Drag agents / facing with LMB", x, y, 16, DARKGRAY); y += 18;
     DrawText("  LMB drag empty space: create obstacle", x, y, 16, DARKGRAY); y += 18;
+    DrawText("  Click obstacle to select; drag to move", x, y, 16, DARKGRAY); y += 18;
+    DrawText("  Drag yellow corners to resize", x, y, 16, DARKGRAY); y += 18;
+    DrawText("  Delete/Backspace: delete selected", x, y, 16, DARKGRAY); y += 18;
     DrawText("  [ / ] : T down/up", x, y, 16, DARKGRAY); y += 18;
     DrawText("  , / . : cellSize down/up", x, y, 16, DARKGRAY); y += 18;
     DrawText("  1: toggle self reachable", x, y, 16, DARKGRAY); y += 18;
     DrawText("  2: toggle enemy reachable", x, y, 16, DARKGRAY); y += 26;
+
     y = std::max(y, FOV_SLIDER_Y + 60);
+
     // ---- FOV slider UI ----
     DrawText("Field of View (deg)", VIEW_W + 16, FOV_SLIDER_Y - 22, 16, BLACK);
-
-    // Track
     DrawRectangleRec(fovTrack, LIGHTGRAY);
     DrawRectangleLinesEx(fovTrack, 1, DARKGRAY);
 
-    // Knob
-    float knobT = (float)((fovDeg - 5.0) / (360.0 - 5.0));
+    float knobT = (float)((fovDeg - FOV_MIN) / (FOV_MAX - FOV_MIN));
     float knobX = fovTrack.x + knobT * fovTrack.width;
-
     DrawCircle((int)knobX, (int)(fovTrack.y + fovTrack.height / 2), 7, DARKBLUE);
 
-    // Value label
-    DrawText(TextFormat("%.0f°", fovDeg),
-            VIEW_W + 16,
-            FOV_SLIDER_Y + 24,
-            16,
-            DARKGRAY);
+    DrawText(TextFormat("%.0f°", fovDeg), VIEW_W + 16, FOV_SLIDER_Y + 24, 16, DARKGRAY);
 
-
-
+    // Analysis text
     {
-      std::string line = "T=" + std::to_string(scene.T) + "  cellSize=" + std::to_string(scene.cellSize) +
+      std::string line = "T=" + std::to_string(scene.T) +
+                         "  cellSize=" + std::to_string(scene.cellSize) +
                          "  visSamples=" + std::to_string(scene.visibilitySamples);
       DrawText(line.c_str(), x, y, 18, BLACK); y += 24;
     }
@@ -591,22 +695,15 @@ int main() {
       DrawText(line.c_str(), x, y, 18, BLACK); y += 22;
     }
 
-    // Explanation strings (first 2)
-// Explanation strings (wrap inside sidebar)
+    // Explanation strings (wrap)
     y += 10;
-
-    const float wrapW = (float)SIDEBAR_W - 32.0f;   // sidebar padding (16 left + 16 right)
-    const float fontSize = 14.0f;
-    const float spacing  = 1.0f;
+    const int wrapW = SIDEBAR_W - 32;
+    const int fontSize = 14;
 
     for (size_t i = 0; i < result.explanations.size() && i < 2; ++i) {
-      Rectangle r{ (float)x, (float)y, wrapW, 200.0f }; // 200px tall "box" for wrapped text
-      DrawTextWrapped(result.explanations[i].c_str(), x, y, fontSize, wrapW, GRAY);
-
-      // advance y by the box height + padding (simple + reliable for now)
-      y += (int)r.height + 10;
+      int used = DrawTextWrapped(result.explanations[i], x, y, fontSize, wrapW, GRAY);
+      y += used + 10;
     }
-
 
     EndDrawing();
   }
