@@ -84,32 +84,6 @@ The `fps_viewer` executable provides a real-time sandbox for exploring positioni
 - `1`: toggle self reachable area overlay
 - `2`: toggle enemy reachable area overlay
 
----
-
-## Repository Structure
-
-.
-├── include/
-│ ├── analysis/ # Analysis interfaces and result types
-│ ├── core/ # Scene, map, and agent definitions
-│ └── geom/ # Vec2, AABB, raycasting utilities
-├── src/
-│ ├── analysis/ # Metric implementations
-│ ├── core/
-│ └── io/
-├── viewer/
-│ └── main.cpp # Interactive raylib viewer
-├── examples/
-│ ├── example_open.cpp
-│ └── example_wall.cpp
-├── tests/
-│ ├── test_reachability.cpp
-│ ├── test_exposure.cpp
-│ ├── test_visibility.cpp
-│ └── test_scene_analyzer.cpp
-├── CMakeLists.txt
-└── README.md
-
 
 ---
 
